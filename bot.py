@@ -1,11 +1,13 @@
+import asyncio
 import time
 import os
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -67,76 +69,68 @@ async def close_session(chat_id: int):
 # --- Commands ---
 
 
+def build_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📂 New Session", callback_data="menu:new")],
+        [InlineKeyboardButton("🔴 Close Session", callback_data="menu:close")],
+        [InlineKeyboardButton("📊 Status", callback_data="menu:status")],
+    ])
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Claude Bot\n\n"
-        "Commands:\n"
-        "/new <dir> - Create new session with working directory\n"
-        "/close   - Close current session\n"
-        "/status  - View session status\n\n"
-        "Send a message to chat with Claude."
+        "Claude Bot\n\nUse the buttons below or send a message to chat with Claude.",
+        reply_markup=build_menu_keyboard(),
     )
 
 
-async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
     chat_id = update.effective_chat.id
-    if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("You are not allowed to use this bot.")
+    user_id = update.effective_user.id
+
+    if not is_allowed(user_id):
+        await query.edit_message_text("You are not allowed to use this bot.")
         return
 
-    if chat_id in sessions:
+    action = query.data.removeprefix("menu:")
+
+    if action == "new":
+        context.user_data["awaiting_cwd"] = True
+        await query.edit_message_text(
+            "Send the working directory path (or send /tmp for default):"
+        )
+
+    elif action == "close":
+        if chat_id not in sessions:
+            await query.edit_message_text(
+                "No active session.", reply_markup=build_menu_keyboard()
+            )
+            return
         await close_session(chat_id)
-
-    cwd = context.args[0] if context.args else "/tmp"
-
-    if not os.path.isdir(cwd):
-        await update.message.reply_text(f"Directory does not exist: {cwd}")
-        return
-
-    try:
-        await create_session(chat_id, cwd)
-        await update.message.reply_text(f"Created new session at: {cwd}")
-    except Exception as e:
-        logger.error("Error creating session: %s", e, exc_info=True)
-        await update.message.reply_text(f"Error creating session: {e}")
-
-
-async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("You are not allowed to use this bot.")
-        return
-
-    if chat_id not in sessions:
-        await update.message.reply_text("No active session.")
-        return
-
-    await close_session(chat_id)
-    await update.message.reply_text("Session closed.")
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_allowed(update.effective_user.id):
-        return
-
-    s = sessions.get(chat_id)
-    if not s:
-        await update.message.reply_text(
-            "No active session.\nUse /new <dir> to create a new session."
+        await query.edit_message_text(
+            "Session closed.", reply_markup=build_menu_keyboard()
         )
-    else:
-        await update.message.reply_text(
-            f"Session running\nWorking directory: {s.get('cwd', 'N/A')}"
-        )
+
+    elif action == "status":
+        s = sessions.get(chat_id)
+        if not s:
+            await query.edit_message_text(
+                "No active session.\nTap 📂 New Session to create one.",
+                reply_markup=build_menu_keyboard(),
+            )
+        else:
+            await query.edit_message_text(
+                f"Session running\nWorking directory: {s.get('cwd', 'N/A')}",
+                reply_markup=build_menu_keyboard(),
+            )
 
 
 # --- Message Handler ---
-
-
-STREAM_DEBOUNCE_SEC = 1.0
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,30 +138,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     bot = context.bot
 
+    logger.info("Received message: %s (reply_to: %s, chat_id: %s, msg_id: %s)",
+                 text, update.message.reply_to_message, chat_id, update.message.message_id)
+
     if not text:
         return
 
     if not is_allowed(update.effective_user.id):
         return
 
+    # Handle "awaiting_cwd" state from inline menu
+    if context.user_data.get("awaiting_cwd"):
+        context.user_data.pop("awaiting_cwd", None)
+        cwd = text.strip()
+
+        if chat_id in sessions:
+            await close_session(chat_id)
+
+        if not os.path.isdir(cwd):
+            await update.message.reply_text(
+                f"Directory does not exist: {cwd}",
+                reply_markup=build_menu_keyboard(),
+            )
+            return
+
+        try:
+            await create_session(chat_id, cwd)
+            await update.message.reply_text(
+                f"Created new session at: {cwd}",
+                reply_markup=build_menu_keyboard(),
+            )
+        except Exception as e:
+            logger.error("Error creating session: %s", e, exc_info=True)
+            await update.message.reply_text(f"Error creating session: {e}")
+        return
+
     session = sessions.get(chat_id)
+    logger.info("Session check: chat_id=%s, session=%s", chat_id, session is not None)
 
     if not session:
         await update.message.reply_text(
-            "No session yet. Use /new <dir> to create a session."
+            "No session yet. Tap 📂 New Session to create one.",
+            reply_markup=build_menu_keyboard(),
         )
         return
 
     try:
         session["buffer"] = ""
         session["tool_messages"] = {}
+        session["cost"] = ""
 
         # Send placeholder response message
         response_msg = await update.message.reply_text("...")
-        last_edit_time = 0.0
 
         async def on_notification(msg: dict):
-            nonlocal last_edit_time
+
             if msg.get("method") != "session/update":
                 return
 
@@ -178,21 +203,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 content = update_data.get("content", {})
                 if content.get("type") == "text":
                     session["buffer"] += content.get("text", "")
-
-                    # Debounced streaming edit
-                    now = time.monotonic()
-                    if now - last_edit_time >= STREAM_DEBOUNCE_SEC:
-                        last_edit_time = now
-                        preview = session["buffer"].strip()
-                        if preview:
-                            try:
-                                await bot.edit_message_text(
-                                    chat_id=chat_id,
-                                    message_id=response_msg.message_id,
-                                    text=preview[:4096],
-                                )
-                            except Exception:
-                                pass
 
             elif session_update == "tool_call":
                 tool_name = update_data.get("toolName", "Unknown")
@@ -220,6 +230,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
+            elif session_update == "usage_update":
+                cost_info = update_data.get("cost", {})
+                if cost_info:
+                    amount = cost_info.get("amount", 0)
+                    currency = cost_info.get("currency", "USD")
+                    session["cost"] = f"\n\n💰 Cost: {amount:.6f} {currency}"
+
         async def on_permission(params: dict):
             tool_call = params.get("toolCall", {})
             title = tool_call.get("title", "Permission requested")
@@ -238,24 +255,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Typing indicator
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-        # Send prompt and wait for completion
-        await session["client"].prompt(session["session_id"], text)
+        # Build prompt with reply context if replying to a message
+        prompt_text = text
+        reply_msg = update.message.reply_to_message
+        if reply_msg and reply_msg.text:
+            prompt_text = (
+                f"[Replying to: {reply_msg.text}]\n\n{text}"
+            )
 
-        # Final edit with complete response
+        # Send prompt and wait for completion
+        await session["client"].prompt(session["session_id"], prompt_text)
+
+        # Send response (buffer already updated via notifications)
         response = session["buffer"].strip()
+        cost = session.get("cost", "")
         if response:
-            # Split into 4096-char chunks
-            chunks = [response[i : i + 4096] for i in range(0, len(response), 4096)]
+            response += cost
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=response_msg.message_id,
-                    text=chunks[0],
+                    text=response[:4096],
                 )
             except Exception:
-                await bot.send_message(chat_id=chat_id, text=chunks[0])
-            for chunk in chunks[1:]:
-                await bot.send_message(chat_id=chat_id, text=chunk)
+                await bot.send_message(chat_id=chat_id, text=response[:4096])
+                # Send remaining chunks
+                if len(response) > 4096:
+                    for i in range(4096, len(response), 4096):
+                        await bot.send_message(chat_id=chat_id, text=response[i:i+4096])
         else:
             try:
                 await bot.edit_message_text(
@@ -281,14 +308,14 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    # Commands
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("new", new_command))
-    app.add_handler(CommandHandler("close", close_command))
-    app.add_handler(CommandHandler("status", status_command))
+    # Inline menu callbacks
+    app.add_handler(CallbackQueryHandler(menu_callback))
 
-    # Messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Commands (fallback - main interaction via inline menu)
+    app.add_handler(CommandHandler("start", start_command))
+
+    # Messages - includes / commands now (forwarded to Claude)
+    app.add_handler(MessageHandler(filters.TEXT, handle_message))
 
     app.run_polling()
 

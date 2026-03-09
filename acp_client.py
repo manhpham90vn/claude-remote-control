@@ -110,6 +110,7 @@ class AcpClient:
             logger.warning("Unhandled server request: %s", method)
 
     async def _handle_notification(self, message: dict):
+        logger.info("ACP notification: %s", message)
         if self.notification_callback:
             await self.notification_callback(message)
 
@@ -124,6 +125,7 @@ class AcpClient:
         future = asyncio.get_running_loop().create_future()
         self.pending_requests[self.request_id] = future
 
+        logger.info("Sending request: %s", request)
         self.process.stdin.write((json.dumps(request) + "\n").encode())
         await self.process.stdin.drain()
 
