@@ -1,5 +1,4 @@
 import asyncio
-import time
 import os
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,10 +20,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Store sessions by chat_id
+# Suppress httpx HTTP request logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 sessions: dict[int, dict] = {}
 
-# List of allowed user IDs
+pending_permissions: dict[int, asyncio.Future] = {}
+
 ALLOWED_USER_IDS = set(
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x
 )
@@ -50,7 +52,7 @@ async def create_session(chat_id: int, cwd: str = "/tmp") -> dict:
         "session_id": None,
         "buffer": "",
         "cwd": cwd,
-        "tool_messages": {},  # tool_call_id -> message_id
+        "tool_messages": {},
     }
 
     await client.initialize({"fs": {"readTextFile": True, "writeTextFile": True}})
@@ -70,11 +72,13 @@ async def close_session(chat_id: int):
 
 
 def build_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 New Session", callback_data="menu:new")],
-        [InlineKeyboardButton("🔴 Close Session", callback_data="menu:close")],
-        [InlineKeyboardButton("📊 Status", callback_data="menu:status")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✨ New Session", callback_data="menu:new")],
+            [InlineKeyboardButton("⏹️ Close Session", callback_data="menu:close")],
+            [InlineKeyboardButton("📱 Status", callback_data="menu:status")],
+        ]
+    )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -92,12 +96,33 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    bot = context.bot
 
     if not is_allowed(user_id):
         await query.edit_message_text("You are not allowed to use this bot.")
         return
 
-    action = query.data.removeprefix("menu:")
+    action = query.data
+
+    # Handle permission button clicks
+    if action.startswith("perm:"):
+        option_id = action.removeprefix("perm:")
+        future = pending_permissions.pop(chat_id, None)
+        if future and not future.done():
+            future.set_result(option_id)
+
+        # Delete the permission message
+        try:
+            await bot.delete_message(
+                chat_id=chat_id, message_id=query.message.message_id
+            )
+        except Exception:
+            pass
+
+        await query.answer("Permission granted!")
+        return
+
+    action = action.removeprefix("menu:")
 
     if action == "new":
         context.user_data["awaiting_cwd"] = True
@@ -120,12 +145,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = sessions.get(chat_id)
         if not s:
             await query.edit_message_text(
-                "No active session.\nTap 📂 New Session to create one.",
+                "No active session.\nTap ✨ New Session to create one.",
                 reply_markup=build_menu_keyboard(),
             )
         else:
             await query.edit_message_text(
-                f"Session running\nWorking directory: {s.get('cwd', 'N/A')}",
+                f"🟢 Session Active\n📁 Working directory: `{s.get('cwd', 'N/A')}`",
                 reply_markup=build_menu_keyboard(),
             )
 
@@ -134,15 +159,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    if not update.effective_user:
+        return
+
     chat_id = update.effective_chat.id
     text = update.message.text
     bot = context.bot
 
-    logger.info("Received message: %s (reply_to: %s, chat_id: %s, msg_id: %s)",
-                 text, update.message.reply_to_message, chat_id, update.message.message_id)
-
-    if not text:
-        return
+    logger.info(
+        "Received message: %s (reply_to: %s, chat_id: %s, msg_id: %s)",
+        text,
+        update.message.reply_to_message,
+        chat_id,
+        update.message.message_id,
+    )
 
     if not is_allowed(update.effective_user.id):
         return
@@ -174,11 +207,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     session = sessions.get(chat_id)
-    logger.info("Session check: chat_id=%s, session=%s", chat_id, session is not None)
 
     if not session:
         await update.message.reply_text(
-            "No session yet. Tap 📂 New Session to create one.",
+            "No session yet. Tap ✨ New Session to create one.",
             reply_markup=build_menu_keyboard(),
         )
         return
@@ -192,7 +224,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response_msg = await update.message.reply_text("...")
 
         async def on_notification(msg: dict):
-
             if msg.get("method") != "session/update":
                 return
 
@@ -203,51 +234,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 content = update_data.get("content", {})
                 if content.get("type") == "text":
                     session["buffer"] += content.get("text", "")
-
-            elif session_update == "tool_call":
-                tool_name = update_data.get("toolName", "Unknown")
-                tool_call_id = update_data.get("toolCallId")
-                msg_obj = await bot.send_message(
-                    chat_id=chat_id, text=f"🔧 {tool_name}..."
-                )
-                session["tool_messages"][tool_call_id] = msg_obj.message_id
-
-            elif session_update == "tool_call_update":
-                tool_call_id = update_data.get("toolCallId")
-                status = update_data.get("status")
-                meta = update_data.get("_meta", {}).get("claudeCode", {})
-                tool_name = meta.get("toolName", "Tool")
-
-                msg_id = session["tool_messages"].get(tool_call_id)
-                if msg_id:
-                    icon = "✅" if status == "completed" else "❌"
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            text=f"{icon} {tool_name}",
-                        )
-                    except Exception:
-                        pass
-
             elif session_update == "usage_update":
                 cost_info = update_data.get("cost", {})
                 if cost_info:
                     amount = cost_info.get("amount", 0)
                     currency = cost_info.get("currency", "USD")
-                    session["cost"] = f"\n\n💰 Cost: {amount:.6f} {currency}"
+                    session["cost"] = f"\n\n💵 Cost: `${amount:.6f}` {currency}"
 
         async def on_permission(params: dict):
             tool_call = params.get("toolCall", {})
             title = tool_call.get("title", "Permission requested")
-            await bot.send_message(chat_id=chat_id, text=f"🔑 {title}")
-
+            desc = tool_call.get("description", "")
             options = params.get("options", [])
-            option_id = next(
-                (o["optionId"] for o in options if o.get("kind") == "allow_once"),
-                options[0]["optionId"] if options else "allow_once",
+
+            keyboard = []
+            for opt in options:
+                opt_id = opt.get("optionId")
+                kind = opt.get("kind", "")
+                label = opt.get("label", opt_id)
+                if kind == "deny":
+                    icon = "⛔"
+                elif "always" in kind or "remember" in kind:
+                    icon = "🔐"
+                else:
+                    icon = "✅"
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            f"{label} {icon}", callback_data=f"perm:{opt_id}"
+                        )
+                    ]
+                )
+
+            perm_text = f"🔐 Permission Required\n\n{title}"
+            if desc:
+                perm_text += f"\n{desc}"
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=perm_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
-            return {"outcome": {"outcome": "selected", "optionId": option_id}}
+
+            # Wait for user to pick an option
+            future = asyncio.get_running_loop().create_future()
+            pending_permissions[chat_id] = future
+            selected = await future
+
+            return {"outcome": {"outcome": "selected", "optionId": selected}}
 
         session["client"].notification_callback = on_notification
         session["client"].permission_callback = on_permission
@@ -259,9 +293,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt_text = text
         reply_msg = update.message.reply_to_message
         if reply_msg and reply_msg.text:
-            prompt_text = (
-                f"[Replying to: {reply_msg.text}]\n\n{text}"
-            )
+            prompt_text = f"[Replying to: {reply_msg.text}]\n\n{text}"
 
         # Send prompt and wait for completion
         await session["client"].prompt(session["session_id"], prompt_text)
@@ -282,7 +314,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Send remaining chunks
                 if len(response) > 4096:
                     for i in range(4096, len(response), 4096):
-                        await bot.send_message(chat_id=chat_id, text=response[i:i+4096])
+                        await bot.send_message(
+                            chat_id=chat_id, text=response[i : i + 4096]
+                        )
         else:
             try:
                 await bot.edit_message_text(
@@ -306,7 +340,7 @@ def main():
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN not set")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).concurrent_updates(True).build()
 
     # Inline menu callbacks
     app.add_handler(CallbackQueryHandler(menu_callback))
