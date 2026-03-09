@@ -1,0 +1,3 @@
+[submodule "claude-agent-acp"]
+	path = claude-agent-acp
+	url = git@github.com:zed-industries/claude-agent-acp.git
