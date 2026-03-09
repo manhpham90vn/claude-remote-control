@@ -1,3 +1,4 @@
+import time
 import os
 import logging
 from telegram import Update
@@ -8,6 +9,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.constants import ChatAction
 from dotenv import load_dotenv
 
 from acp_client import AcpClient
@@ -46,17 +48,8 @@ async def create_session(chat_id: int, cwd: str = "/tmp") -> dict:
         "session_id": None,
         "buffer": "",
         "cwd": cwd,
+        "tool_messages": {},  # tool_call_id -> message_id
     }
-
-    async def on_notification(msg: dict):
-        if msg.get("method") == "session/update":
-            update_data = msg.get("params", {}).get("update", {})
-            if update_data.get("sessionUpdate") == "agent_message_chunk":
-                content = update_data.get("content", {})
-                if content.get("type") == "text":
-                    session_data["buffer"] += content.get("text", "")
-
-    client.notification_callback = on_notification
 
     await client.initialize({"fs": {"readTextFile": True, "writeTextFile": True}})
     session_data["session_id"] = await client.new_session(cwd)
@@ -143,9 +136,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Message Handler ---
 
 
+STREAM_DEBOUNCE_SEC = 1.0
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text
+    bot = context.bot
 
     if not text:
         return
@@ -155,21 +152,120 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = sessions.get(chat_id)
 
+    if not session:
+        await update.message.reply_text(
+            "No session yet. Use /new <dir> to create a session."
+        )
+        return
+
     try:
-        if not session:
-            await update.message.reply_text(
-                "No session yet. Use /new <dir> to create a session."
-            )
-            return
-
         session["buffer"] = ""
+        session["tool_messages"] = {}
 
+        # Send placeholder response message
+        response_msg = await update.message.reply_text("...")
+        last_edit_time = 0.0
+
+        async def on_notification(msg: dict):
+            nonlocal last_edit_time
+            if msg.get("method") != "session/update":
+                return
+
+            update_data = msg.get("params", {}).get("update", {})
+            session_update = update_data.get("sessionUpdate")
+
+            if session_update == "agent_message_chunk":
+                content = update_data.get("content", {})
+                if content.get("type") == "text":
+                    session["buffer"] += content.get("text", "")
+
+                    # Debounced streaming edit
+                    now = time.monotonic()
+                    if now - last_edit_time >= STREAM_DEBOUNCE_SEC:
+                        last_edit_time = now
+                        preview = session["buffer"].strip()
+                        if preview:
+                            try:
+                                await bot.edit_message_text(
+                                    chat_id=chat_id,
+                                    message_id=response_msg.message_id,
+                                    text=preview[:4096],
+                                )
+                            except Exception:
+                                pass
+
+            elif session_update == "tool_call":
+                tool_name = update_data.get("toolName", "Unknown")
+                tool_call_id = update_data.get("toolCallId")
+                msg_obj = await bot.send_message(
+                    chat_id=chat_id, text=f"🔧 {tool_name}..."
+                )
+                session["tool_messages"][tool_call_id] = msg_obj.message_id
+
+            elif session_update == "tool_call_update":
+                tool_call_id = update_data.get("toolCallId")
+                status = update_data.get("status")
+                meta = update_data.get("_meta", {}).get("claudeCode", {})
+                tool_name = meta.get("toolName", "Tool")
+
+                msg_id = session["tool_messages"].get(tool_call_id)
+                if msg_id:
+                    icon = "✅" if status == "completed" else "❌"
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=msg_id,
+                            text=f"{icon} {tool_name}",
+                        )
+                    except Exception:
+                        pass
+
+        async def on_permission(params: dict):
+            tool_call = params.get("toolCall", {})
+            title = tool_call.get("title", "Permission requested")
+            await bot.send_message(chat_id=chat_id, text=f"🔑 {title}")
+
+            options = params.get("options", [])
+            option_id = next(
+                (o["optionId"] for o in options if o.get("kind") == "allow_once"),
+                options[0]["optionId"] if options else "allow_once",
+            )
+            return {"outcome": {"outcome": "selected", "optionId": option_id}}
+
+        session["client"].notification_callback = on_notification
+        session["client"].permission_callback = on_permission
+
+        # Typing indicator
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+        # Send prompt and wait for completion
         await session["client"].prompt(session["session_id"], text)
 
+        # Final edit with complete response
         response = session["buffer"].strip()
         if response:
-            for i in range(0, len(response), 4096):
-                await update.message.reply_text(response[i : i + 4096])
+            # Split into 4096-char chunks
+            chunks = [response[i : i + 4096] for i in range(0, len(response), 4096)]
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=response_msg.message_id,
+                    text=chunks[0],
+                )
+            except Exception:
+                await bot.send_message(chat_id=chat_id, text=chunks[0])
+            for chunk in chunks[1:]:
+                await bot.send_message(chat_id=chat_id, text=chunk)
+        else:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=response_msg.message_id,
+                    text="(no response)",
+                )
+            except Exception:
+                pass
+
     except Exception as e:
         logger.error(
             "Error handling message for chat %s: %s", chat_id, e, exc_info=True

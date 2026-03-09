@@ -14,6 +14,7 @@ class AcpClient:
         self.pending_requests: dict[int, asyncio.Future] = {}
         self.notification_callback: Optional[Callable] = None
         self.error_callback: Optional[Callable] = None
+        self.permission_callback: Optional[Callable] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._closed = False
 
@@ -35,11 +36,19 @@ class AcpClient:
                 if not line:
                     break
                 message = json.loads(line.decode())
-                if "id" in message:
+                has_id = "id" in message
+                has_method = "method" in message
+
+                if has_id and has_method:
+                    # Server→client request (e.g. permission request)
+                    await self._handle_server_request(message)
+                elif has_id:
+                    # Response to our request
                     future = self.pending_requests.pop(message["id"], None)
                     if future:
                         future.set_result(message)
                 else:
+                    # Notification
                     await self._handle_notification(message)
         except asyncio.CancelledError:
             pass
@@ -73,6 +82,32 @@ class AcpClient:
                     error or Exception("ACP process terminated unexpectedly")
                 )
         self.pending_requests.clear()
+
+    async def _handle_server_request(self, message: dict):
+        """Handle requests from server to client (e.g. permission requests)."""
+        method = message.get("method")
+        request_id = message.get("id")
+        params = message.get("params", {})
+
+        if method == "session/request_permission":
+            # Call permission callback or auto-allow
+            if self.permission_callback:
+                result = await self.permission_callback(params)
+            else:
+                # Auto-allow: find "allow_once" option
+                options = params.get("options", [])
+                option_id = next(
+                    (o["optionId"] for o in options if o.get("kind") == "allow_once"),
+                    options[0]["optionId"] if options else "allow_once",
+                )
+                result = {"outcome": {"outcome": "selected", "optionId": option_id}}
+
+            # Send response back
+            response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+            self.process.stdin.write((json.dumps(response) + "\n").encode())
+            await self.process.stdin.drain()
+        else:
+            logger.warning("Unhandled server request: %s", method)
 
     async def _handle_notification(self, message: dict):
         if self.notification_callback:
